@@ -130,6 +130,13 @@ func ExtractContent(page pdf.Page) (result Content) {
 			return
 		}
 
+		// For non-CID fonts with bfchar map (e.g. TrueType with custom encoding):
+		// decode each byte using the ToUnicode map directly
+		if g.font.bfCharMap != nil && !g.font.identityH {
+			showTextBfChar(s, g.font, &g, &chars)
+			return
+		}
+
 		// Standard path: use digitorus/pdf encoder
 		decoded := enc.Decode(s)
 		rawPos := 0
@@ -290,9 +297,11 @@ func ExtractContent(page pdf.Page) (result Content) {
 						fi.cidWidths = parseCIDWidths(fontDict)
 						cidCache[cacheKey] = fi.cidWidths
 					}
-					// Parse beginbfchar mappings that digitorus/pdf misses
-					fi.bfCharMap = parseBfCharMap(fontDict)
 				}
+
+				// Parse ToUnicode bfchar/bfrange mappings for all fonts
+				// (TrueType fonts with custom encoding also need this)
+				fi.bfCharMap = parseBfCharMap(fontDict)
 
 				g.font = fi
 			}
@@ -395,6 +404,46 @@ func showTextCID(s string, fi *fontInfo, g *graphicsState, chars *[]Char) {
 		ch, ok := fi.bfCharMap[cid]
 		if !ok {
 			ch = rune(cid) // fallback to raw CID value
+		}
+
+		if ch != ' ' && ch != 0 {
+			*chars = append(*chars, Char{
+				Text:     string(ch),
+				FontName: fi.name,
+				FontSize: trm[0][0],
+				X:        trm[2][0],
+				Y:        trm[2][1],
+				W:        charWidth,
+			})
+		}
+
+		tx := w0/1000*g.Tfs + g.Tc
+		if ch == ' ' {
+			tx += g.Tw
+		}
+		tx *= g.Th
+		g.Tm = matrix{{1, 0, 0}, {0, 1, 0}, {tx, 0, 1}}.mul(g.Tm)
+	}
+}
+
+// showTextBfChar handles text rendering for non-CID fonts (e.g. TrueType)
+// that have a ToUnicode bfchar map with single-byte codes.
+func showTextBfChar(s string, fi *fontInfo, g *graphicsState, chars *[]Char) {
+	for pos := 0; pos < len(s); pos++ {
+		code := uint16(s[pos])
+
+		trm := matrix{
+			{g.Tfs * g.Th, 0, 0},
+			{0, g.Tfs, 0},
+			{0, g.Trise, 1},
+		}.mul(g.Tm).mul(g.CTM)
+
+		w0, _ := fi.glyphWidth(s, pos)
+		charWidth := w0 / 1000 * trm[0][0]
+
+		ch, ok := fi.bfCharMap[code]
+		if !ok {
+			ch = rune(code) // fallback
 		}
 
 		if ch != ' ' && ch != 0 {

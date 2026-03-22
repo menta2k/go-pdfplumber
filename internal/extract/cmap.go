@@ -6,9 +6,10 @@ import (
 	"github.com/digitorus/pdf"
 )
 
-// parseBfCharMap parses the ToUnicode CMap's beginbfchar entries directly
-// from the CMap stream data. Returns a CID→Unicode mapping.
-// digitorus/pdf only handles beginbfrange, not beginbfchar.
+// parseBfCharMap parses the ToUnicode CMap's beginbfchar and beginbfrange
+// entries directly from the CMap stream data. Returns a code→Unicode mapping.
+// digitorus/pdf only handles beginbfrange, not beginbfchar, and may fail
+// on TrueType fonts with custom single-byte encodings.
 func parseBfCharMap(fontDict pdf.Value) map[uint16]rune {
 	toUnicode := fontDict.Key("ToUnicode")
 	if toUnicode.IsNull() {
@@ -20,32 +21,50 @@ func parseBfCharMap(fontDict pdf.Value) map[uint16]rune {
 		return nil
 	}
 
-	return parseCMapBfChar(data)
+	return parseCMapEntries(data)
 }
 
-// parseCMapBfChar extracts beginbfchar mappings from raw CMap data.
-// Format: <srcCode> <dstUnicode>
-func parseCMapBfChar(data []byte) map[uint16]rune {
+// parseCMapEntries extracts both beginbfchar and beginbfrange mappings from raw CMap data.
+func parseCMapEntries(data []byte) map[uint16]rune {
 	result := make(map[uint16]rune)
 	s := string(data)
 
-	// Find all beginbfchar...endbfchar sections
+	// Parse all beginbfchar...endbfchar sections
+	remaining := s
 	for {
-		start := indexOf(s, "beginbfchar")
+		start := indexOf(remaining, "beginbfchar")
 		if start < 0 {
 			break
 		}
-		s = s[start+len("beginbfchar"):]
+		remaining = remaining[start+len("beginbfchar"):]
 
-		end := indexOf(s, "endbfchar")
+		end := indexOf(remaining, "endbfchar")
 		if end < 0 {
 			break
 		}
-		section := s[:end]
-		s = s[end+len("endbfchar"):]
+		section := remaining[:end]
+		remaining = remaining[end+len("endbfchar"):]
 
-		// Parse pairs: <hex1> <hex2>
 		parseBfCharSection(section, result)
+	}
+
+	// Parse all beginbfrange...endbfrange sections
+	remaining = s
+	for {
+		start := indexOf(remaining, "beginbfrange")
+		if start < 0 {
+			break
+		}
+		remaining = remaining[start+len("beginbfrange"):]
+
+		end := indexOf(remaining, "endbfrange")
+		if end < 0 {
+			break
+		}
+		section := remaining[:end]
+		remaining = remaining[end+len("endbfrange"):]
+
+		parseBfRangeSection(section, result)
 	}
 
 	if len(result) == 0 {
@@ -89,11 +108,70 @@ func parseBfCharSection(section string, result map[uint16]rune) {
 		src := decodeHex(srcHex)
 		dst := decodeHex(dstHex)
 
-		if len(src) >= 2 && len(dst) >= 2 {
-			cid := binary.BigEndian.Uint16(src)
-			uni := rune(binary.BigEndian.Uint16(dst))
-			result[cid] = uni
+		code := hexToCode(src)
+		uni := hexToRune(dst)
+		if code >= 0 && uni > 0 {
+			result[uint16(code)] = uni
 		}
+	}
+}
+
+// parseBfRangeSection parses beginbfrange entries: <start> <end> <dstStart>
+func parseBfRangeSection(section string, result map[uint16]rune) {
+	i := 0
+	for i < len(section) {
+		// Parse 3 hex values: <start> <end> <dstStart>
+		var hexVals [3][]byte
+		for h := 0; h < 3; h++ {
+			start := indexOf(section[i:], "<")
+			if start < 0 {
+				return
+			}
+			start += i
+			end := indexOf(section[start+1:], ">")
+			if end < 0 {
+				return
+			}
+			end += start + 1
+			hexVals[h] = decodeHex(section[start+1 : end])
+			i = end + 1
+		}
+
+		rangeStart := hexToCode(hexVals[0])
+		rangeEnd := hexToCode(hexVals[1])
+		dstStart := hexToRune(hexVals[2])
+
+		if rangeStart < 0 || rangeEnd < 0 || dstStart <= 0 {
+			continue
+		}
+
+		for code := rangeStart; code <= rangeEnd; code++ {
+			result[uint16(code)] = dstStart + rune(code-rangeStart)
+		}
+	}
+}
+
+// hexToCode converts decoded hex bytes to a code value (1 or 2 bytes).
+func hexToCode(b []byte) int {
+	switch len(b) {
+	case 1:
+		return int(b[0])
+	case 2:
+		return int(binary.BigEndian.Uint16(b))
+	default:
+		return -1
+	}
+}
+
+// hexToRune converts decoded hex bytes to a Unicode rune (2 or 4 bytes).
+func hexToRune(b []byte) rune {
+	switch len(b) {
+	case 2:
+		return rune(binary.BigEndian.Uint16(b))
+	case 4:
+		return rune(binary.BigEndian.Uint32(b))
+	default:
+		return 0
 	}
 }
 
